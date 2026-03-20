@@ -44,7 +44,7 @@ This is directional value trading, not guaranteed risk-free arbitrage.
 - Paper execution adapter with deterministic behavior
 - Position lifecycle rules (TP/SL/max-hold)
 - JSON/CSV exports and JSONL audit logs
-
+ 
 ## Architecture
 Packages:
 - `poly_sports/data_fetching/` (fetch and compare)
