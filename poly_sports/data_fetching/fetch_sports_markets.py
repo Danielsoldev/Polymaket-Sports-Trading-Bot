@@ -1,0 +1,1217 @@
+"""Fetch sports market data from Polymarket using Gamma API and optionally enrich with CLOB data."""
+# Suppress urllib3 OpenSSL warning (non-critical) - must be before urllib3 is imported
+# This warning occurs when urllib3 v2 is used with LibreSSL instead of OpenSSL
+import warnings
+warnings.filterwarnings('ignore', message='.*urllib3.*OpenSSL.*')
+warnings.filterwarnings('ignore', message='.*NotOpenSSLWarning.*')
+
+import os
+import json
+import csv
+import re
+import sys
+import requests
+from datetime import datetime, timezone
+from typing import List, Dict, Any, Optional
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Additional suppression after urllib3 is loaded
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.NotOpenSSLWarning)
+except (ImportError, AttributeError):
+    pass
+
+try:
+    from py_clob_client.client import ClobClient
+except ImportError:
+    # Handle case where py-clob-client is not installed
+    ClobClient = None
+
+
+from poly_sports.utils import file_utils
+from poly_sports.utils.file_utils import save_json
+from poly_sports.utils.logger import logger
+
+# Load environment variables
+load_dotenv()
+
+# Backward-compatibility alias for older tests/import paths.
+sys.modules.setdefault("fetch_sports_markets", sys.modules[__name__])
+
+
+def filter_sports_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filter markets to only include those with category == 'Sports'.
+    
+    Args:
+        markets: List of market dictionaries
+        
+    Returns:
+        Filtered list of sports markets (case-insensitive)
+    """
+    sports_markets = []
+    for market in markets:
+        category = market.get('category', '')
+        if category and category.lower() == 'sports':
+            sports_markets.append(market)
+    return sports_markets
+
+
+def _fetch_sports_markets_v1(api_url: str, limit: int = 1500, series_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    [DEPRECATED] Original implementation using events endpoint with series_id filters.
+    
+    This function is kept for comparison purposes only. Use fetch_sports_markets() instead.
+    
+    Args:
+        api_url: Base URL for Gamma API
+        limit: Maximum number of events to fetch per request (default: 1500)
+        series_ids: List of sports series IDs to filter. If None, uses default sports series IDs.
+        
+    Returns:
+        List of sports market dictionaries with all available fields
+    """
+    # Default sports series IDs (from Polymarket sports page)
+    if series_ids is None:
+        series_ids = [
+            10187, 3, 10210, 10345, 10105, 10470, 10471, 10346, 10188, 10193,
+            10204, 10194, 10195, 10203, 10189, 10209, 10437, 10438, 10439, 10444,
+            10443, 10312, 10313, 10314, 10365, 10366, 10355, 10238, 10240, 10243,
+            10244, 10246, 10245, 10242, 10292, 10290, 10289, 10286, 10287, 10291,
+            10311, 10445, 10451, 10528, 10455, 10446, 10449, 10448, 10447, 10450,
+            10453, 10330, 10317, 10315, 10359, 10363, 10364, 10360, 10362, 10361
+        ]
+    
+    all_markets = []
+    
+    # Use events endpoint (not events/pagination)
+    url = f"{api_url}/events"
+    
+    # Use requests params with list to handle multiple series_id parameters
+    request_params = {
+        'limit': limit,
+        'closed': 'false',
+        'active': 'true',
+        'archived': 'false',
+        'order': 'startTime',
+        'include_chat': 'true'
+    }
+    
+    # Add all series_id parameters as a list (requests will format as multiple params)
+    request_params['series_id'] = series_ids
+    
+    try:
+        response = requests.get(url, params=request_params)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Events endpoint returns a list directly
+        if isinstance(data, list):
+            events = data
+        elif isinstance(data, dict):
+            # Fallback: handle dict response if API changes
+            events = data.get('data', [])
+        else:
+            events = []
+        
+    except requests.exceptions.RequestException as e:
+        raise requests.exceptions.RequestException(f"Error fetching markets: {e}")
+    
+    return events
+
+
+def _fetch_sports_markets_v2(api_url: str, limit_per_page: int = 50, max_events: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch all sports markets from Gamma API using events/pagination endpoint with tag_slug filter.
+    
+    This version uses the pagination endpoint with tag_slug=sports, which may retrieve
+    different or more events than the series_id-based approach.
+    
+    Args:
+        api_url: Base URL for Gamma API
+        limit_per_page: Number of events to fetch per page (default: 50, matching website)
+        max_events: Maximum total events to fetch. If None, fetches all available.
+        
+    Returns:
+        List of sports market dictionaries with all available fields
+    """
+    all_events = []
+    
+    # Use events/pagination endpoint
+    url = f"{api_url}/events/pagination"
+    
+    # Headers matching the curl command
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'en,ar;q=0.9,zh-TW;q=0.8,zh;q=0.7,en-US;q=0.6',
+        'Connection': 'keep-alive',
+        'Origin': 'https://polymarket.com',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site',
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36',
+        'sec-ch-ua': '"Google Chrome";v="141", "Not?A_Brand";v="8", "Chromium";v="141"',
+        'sec-ch-ua-mobile': '?0',
+        'sec-ch-ua-platform': '"macOS"'
+    }
+    
+    # Request parameters matching the curl command
+    request_params = {
+        'limit': limit_per_page,
+        'active': 'true',
+        'archived': 'false',
+        'tag_slug': 'sports',
+        'closed': 'false',
+        'order': 'volume',
+        'ascending': 'false'
+    }
+    
+    page = 0
+    has_more = True
+    cursor = None
+    
+    try:
+        while has_more:
+            # Add cursor for pagination if we have one from previous request
+            current_params = request_params.copy()
+            if cursor:
+                current_params['cursor'] = cursor
+            elif page > 0:
+                # If no cursor but we're past first page, try offset-based pagination
+                current_params['offset'] = page * limit_per_page
+            
+            response = requests.get(url, params=current_params, headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            # Handle different response formats
+            if isinstance(data, list):
+                events = data
+                has_more = len(events) == limit_per_page and len(events) > 0
+                cursor = None  # No cursor for list responses
+            elif isinstance(data, dict):
+                # Pagination endpoints often return {data: [...], cursor: ..., hasMore: ...}
+                events = data.get('data', [])
+                cursor = data.get('cursor') or data.get('nextCursor')
+                has_more = data.get('hasMore', False) or (cursor is not None and len(events) == limit_per_page)
+                
+                # If no explicit hasMore flag, infer from response
+                if 'hasMore' not in data and cursor is None:
+                    has_more = len(events) == limit_per_page
+            else:
+                events = []
+                has_more = False
+                cursor = None
+            
+            all_events.extend(events)
+            
+            # Check if we've reached max_events limit
+            if max_events and len(all_events) >= max_events:
+                all_events = all_events[:max_events]
+                has_more = False
+                break
+            
+            # If we got fewer events than requested and no cursor, we're done
+            if len(events) < limit_per_page and cursor is None:
+                has_more = False
+            
+            page += 1
+            
+            # Safety limit to prevent infinite loops
+            if page > 1000:
+                logger.info(f"Warning: Reached pagination limit (1000 pages), stopping")
+                break
+        
+    except requests.exceptions.RequestException as e:
+        raise requests.exceptions.RequestException(f"Error fetching markets via pagination: {e}")
+    
+    return all_events
+
+
+def fetch_sports_markets(api_url: str, limit: int = 9999, series_ids: Optional[List[int]] = None) -> List[Dict[str, Any]]:
+    """
+    Fetch all sports markets from Gamma API using events/pagination endpoint with tag_slug filter.
+    
+    This function now uses the pagination endpoint (v2 implementation) which retrieves more events
+    than the previous series_id-based approach. The function signature is maintained for backwards
+    compatibility, but the `limit` and `series_ids` parameters are adapted to work with the new
+    pagination-based implementation.
+    
+    Args:
+        api_url: Base URL for Gamma API
+        limit: Maximum number of events to fetch (default: 1500). Used as max_events for pagination.
+        series_ids: [DEPRECATED] This parameter is ignored. The new implementation uses tag_slug=sports
+                   instead of series_id filters to retrieve all sports events.
+        
+    Returns:
+        List of sports event dictionaries with all available fields
+    """
+    # Convert limit to max_events for v2 implementation
+    max_events = limit if limit > 0 else None
+
+    # Use v2 implementation (pagination with tag_slug)
+    events = _fetch_sports_markets_v2(api_url, limit_per_page=50, max_events=max_events)
+    return _extract_markets_from_events(events)
+
+
+def _extract_markets_from_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flatten event payloads into market records (legacy-compatible shape)."""
+    flattened: List[Dict[str, Any]] = []
+    for event in events:
+        event_id = event.get("id")
+        event_title = event.get("title")
+        home_team = event.get("homeTeamName", "")
+        away_team = event.get("awayTeamName", "")
+        start_time = event.get("startTime", event.get("eventDate", ""))
+        event_date = event.get("eventDate", "")
+        ended = event.get("ended", False)
+        live = event.get("live", False)
+        event_liquidity = event.get("liquidity", 0)
+        event_volume = event.get("volume", 0)
+        tags = event.get("tags", []) or []
+        category = "Sports" if any(str(t.get("label", "")).lower() == "sports" for t in tags if isinstance(t, dict)) else ""
+        series_list = event.get("series", []) or []
+        series_ticker = ""
+        if series_list and isinstance(series_list[0], dict):
+            series_ticker = str(series_list[0].get("ticker", "") or "")
+
+        for market in event.get("markets", []) or []:
+            item = dict(market)
+            item.setdefault("event_id", event_id)
+            item.setdefault("event_title", event_title)
+            item.setdefault("homeTeamName", home_team)
+            item.setdefault("awayTeamName", away_team)
+            item.setdefault("startTime", start_time)
+            item.setdefault("eventDate", event_date)
+            item.setdefault("ended", ended)
+            item.setdefault("live", live)
+            item.setdefault("series_ticker", series_ticker)
+            item.setdefault("event_liquidity", event_liquidity)
+            item.setdefault("event_volume", event_volume)
+            # Provide fields expected by comparison/arbitrage modules.
+            item.setdefault("market_id", item.get("id"))
+            item.setdefault("market_outcomes", item.get("outcomes", ""))
+            item.setdefault("market_outcomePrices", item.get("outcomePrices", ""))
+            item.setdefault("market_liquidityNum", item.get("liquidityNum", 0))
+            item.setdefault("market_volumeNum", item.get("volumeNum", 0))
+            item.setdefault("spread", item.get("spread"))
+            if category:
+                item.setdefault("category", category)
+            flattened.append(item)
+    return flattened
+
+
+def enrich_market_with_clob_data(client: ClobClient, market: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enrich a single market with CLOB data (prices, order book, spread).
+    
+    Args:
+        client: Initialized ClobClient instance
+        market: Market dictionary
+        
+    Returns:
+        Market dictionary with added 'clob_data' field
+    """
+    enriched_market = market.copy()
+    
+    # Try to get token IDs from clobTokenIds field (list of token ID strings)
+    clob_token_ids = market.get('clobTokenIds', [])
+    
+    # Fallback to tokens field if clobTokenIds is not available
+    if not clob_token_ids:
+        tokens = market.get('tokens', [])
+        if tokens:  
+            # Extract token_id from token objects
+            clob_token_ids = [token.get('token_id') for token in tokens if token.get('token_id')]
+    
+    if not clob_token_ids:
+        return enriched_market
+    
+    # Use first token ID for CLOB data
+    token_id = clob_token_ids[0]
+    if not token_id:
+        return enriched_market
+    
+    clob_data = {}
+    
+    try:
+        # Get midpoint price
+        midpoint_response = client.get_midpoint(token_id)
+        if midpoint_response:
+            clob_data['midpoint'] = midpoint_response.get('mid')
+    except Exception:
+        pass  # Continue if midpoint fails
+    
+    try:
+        # Get buy price
+        buy_price_response = client.get_price(token_id, side="BUY")
+        if buy_price_response:
+            clob_data['buy_price'] = buy_price_response.get('price')
+    except Exception:
+        pass  # Continue if buy price fails
+    
+    try:
+        # Get sell price
+        sell_price_response = client.get_price(token_id, side="SELL")
+        if sell_price_response:
+            clob_data['sell_price'] = sell_price_response.get('price')
+    except Exception:
+        pass  # Continue if sell price fails
+    
+    try:
+        # Get spread
+        spread_response = client.get_spread(token_id)
+        if spread_response:
+            clob_data['spread'] = spread_response.get('spread')
+    except Exception:
+        pass  # Continue if spread fails
+    
+    try:
+        # Get order book
+        order_book = client.get_order_book(token_id)
+        if order_book:
+            clob_data['order_book'] = {
+                'bids': [{'price': str(bid.price), 'size': str(bid.size)} for bid in order_book.bids[:5]],
+                'asks': [{'price': str(ask.price), 'size': str(ask.size)} for ask in order_book.asks[:5]]
+            }
+    except Exception:
+        pass  # Continue if order book fails
+    
+    if clob_data:
+        enriched_market['clob_data'] = clob_data
+    
+    return enriched_market
+
+
+def enrich_markets_with_clob_data(clob_host: str, markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Enrich multiple markets with CLOB data.
+    
+    Args:
+        clob_host: CLOB API host URL
+        markets: List of market dictionaries
+        
+    Returns:
+        List of enriched market dictionaries
+    """
+    if ClobClient is None:
+        raise ImportError("py-clob-client is not installed. Install it with: pip install py-clob-client")
+    
+    # Initialize read-only CLOB client (no auth needed)
+    client = ClobClient(clob_host)
+    
+    enriched_markets = []
+    for market in markets:
+        enriched = enrich_market_with_clob_data(client, market)
+        enriched_markets.append(enriched)
+    
+    return enriched_markets
+
+
+def enrich_events_with_clob_data(clob_host: str, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Enrich events by enriching markets within each event with CLOB data.
+    
+    Args:
+        clob_host: CLOB API host URL
+        events: List of event dictionaries (each containing nested markets)
+        
+    Returns:
+        List of enriched event dictionaries with enriched markets
+    """
+    if ClobClient is None:
+        raise ImportError("py-clob-client is not installed. Install it with: pip install py-clob-client")
+    
+    # Initialize read-only CLOB client (no auth needed)
+    client = ClobClient(clob_host)
+    
+    enriched_events = []
+    for event in events:
+        enriched_event = event.copy()
+        markets = event.get('markets', [])
+        
+        # Enrich each market in the event
+        enriched_markets = []
+        for market in markets:
+            enriched_market = enrich_market_with_clob_data(client, market)
+            enriched_markets.append(enriched_market)
+        
+        enriched_event['markets'] = enriched_markets
+        enriched_events.append(enriched_event)
+    
+    return enriched_events
+
+
+
+
+def is_1h_moneyline_bet(market: Dict[str, Any]) -> bool:
+    """
+    Check if a market is a 1h (first half) moneyline bet.
+    
+    Args:
+        market: Market dictionary with 'question' and 'groupItemTitle' fields
+        
+    Returns:
+        True if the market is identified as a 1h moneyline bet, False otherwise
+    """
+    question = str(market.get('question', '')).lower()
+    group_item_title = str(market.get('groupItemTitle', '')).lower()
+    
+    # Patterns that indicate 1h moneyline bets
+    patterns = [
+        '1h moneyline',
+        '1st half moneyline',
+        'first half moneyline',
+        '1h ml',
+        '1st half ml',
+        'first half ml',
+        ': 1h',
+        ': 1st half',
+        ': first half'
+    ]
+    
+    # Check if any pattern matches in question or groupItemTitle
+    text_to_check = f"{question} {group_item_title}"
+    return any(pattern in text_to_check for pattern in patterns)
+
+
+def extract_arbitrage_data(events: List[Dict[str, Any]], exclude_1h_moneyline: bool = True) -> List[Dict[str, Any]]:
+    """
+    Extract arbitrage-relevant data from events for trading analysis.
+    
+    Filters out events where ended == True to focus on active/upcoming games.
+    
+    Extracts:
+    - From events: id, endDate, active, liquidity, volume (all), homeTeamName, 
+      awayTeamName, gameId, live, ended, score
+    - From markets: id, liquidityNum, outcomes, outcomePrices, volumeNum (all), 
+      groupItemTitle, groupItemThreshold, spread, PriceChanges, lastTradePrice, 
+      bestBid, bestAsk
+    - From series: id, ticker
+    
+    Additional useful fields for arbitrage:
+    - startTime/eventDate (game timing)
+    - competitive (market competitiveness)
+    - volume metrics (1wk, 1mo, 1yr)
+    - conditionId (market identification)
+    - clobTokenIds (for trading)
+    - period/elapsed (game status)
+    
+    Args:
+        events: List of event dictionaries from Gamma API
+        exclude_1h_moneyline: If True, exclude 1h (first half) moneyline bets. Default: False
+        
+    Returns:
+        List of dictionaries with extracted arbitrage data, one per market.
+        Only includes markets from events that have not ended.
+    """
+    arbitrage_data = []
+    
+    for event in events:
+        # Filter out ended games
+        ended = event.get('ended', False)
+        if ended:
+            continue
+        
+        # Extract event-level fields
+        event_id = event.get('id')
+        event_end_date = event.get('endDate')
+        event_active = event.get('active', False)
+        event_liquidity = event.get('liquidity', 0)
+        event_volume = event.get('volume', 0)
+        event_volume1wk = event.get('volume1wk', 0)
+        event_volume1mo = event.get('volume1mo', 0)
+        event_volume1yr = event.get('volume1yr', 0)
+        home_team_name = event.get('homeTeamName', '')
+        away_team_name = event.get('awayTeamName', '')
+        game_id = event.get('gameId')
+        live = event.get('live', False)
+        score = event.get('score', '')
+        start_time = event.get('startTime', event.get('eventDate', ''))
+        event_date = event.get('eventDate', '')
+        period = event.get('period', '')
+        elapsed = event.get('elapsed', '')
+        competitive = event.get('competitive', 0)
+        
+        # Extract series information
+        series_list = event.get('series', [])
+        series_id = None
+        series_ticker = None
+        if series_list and len(series_list) > 0:
+            series_id = series_list[0].get('id')
+            series_ticker = series_list[0].get('ticker', '')
+        
+        # Extract market-level fields
+        markets = event.get('markets', [])
+        
+        for market in markets:
+            # Skip 1h moneyline bets if option is enabled
+            if exclude_1h_moneyline and is_1h_moneyline_bet(market):
+                continue
+            
+            market_data = {
+                # Event fields
+                'event_id': event_id,
+                'event_endDate': event_end_date,
+                'event_active': event_active,
+                'event_liquidity': event_liquidity,
+                'event_volume': event_volume,
+                'event_volume1wk': event_volume1wk,
+                'event_volume1mo': event_volume1mo,
+                'event_volume1yr': event_volume1yr,
+                'homeTeamName': home_team_name,
+                'awayTeamName': away_team_name,
+                'gameId': game_id,
+                'live': live,
+                'ended': ended,
+                'score': score,
+                'startTime': start_time,
+                'eventDate': event_date,
+                'period': period,
+                'elapsed': elapsed,
+                'competitive': competitive,
+                
+                # Series fields
+                'series_id': series_id,
+                'series_ticker': series_ticker,
+                
+                # Market fields
+                'market_id': market.get('id'),
+                'market_liquidityNum': market.get('liquidityNum', 0),
+                'market_outcomes': market.get('outcomes', ''),
+                'market_outcomePrices': market.get('outcomePrices', ''),
+                'market_volumeNum': market.get('volumeNum', 0),
+                'market_volume1wk': market.get('volume1wk', 0),
+                'market_volume1mo': market.get('volume1mo', 0),
+                'market_volume1yr': market.get('volume1yr', 0),
+                'market_volumeClob': market.get('volumeClob', 0),
+                'groupItemTitle': market.get('groupItemTitle', ''),
+                'groupItemThreshold': market.get('groupItemThreshold', ''),
+                'spread': market.get('spread'),
+                'oneDayPriceChange': market.get('oneDayPriceChange'),
+                'oneHourPriceChange': market.get('oneHourPriceChange'),
+                'oneWeekPriceChange': market.get('oneWeekPriceChange'),
+                'lastTradePrice': market.get('lastTradePrice'),
+                'bestBid': market.get('bestBid'),
+                'bestAsk': market.get('bestAsk'),
+                
+                # Additional useful fields
+                'question': market.get('question', ''),
+                'conditionId': market.get('conditionId', ''),
+                'clobTokenIds': market.get('clobTokenIds', ''),
+                'market_active': market.get('active', False),
+                'market_closed': market.get('closed', False),
+                'market_endDate': market.get('endDate', ''),
+                'market_endDateIso': market.get('endDateIso', ''),
+                'liquidityClob': market.get('liquidityClob', 0),
+                'acceptingOrders': market.get('acceptingOrders', False),
+            }
+            
+            arbitrage_data.append(market_data)
+    
+    return arbitrage_data
+
+
+def filter_match_winner_and_draw_markets(markets: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filter arbitrage markets to only include match winner and draw markets.
+    
+    Includes:
+    - Match winner markets: Markets where outcomes contain team names (not "Over"/"Under"/"Yes"/"No")
+    - Match winner markets (three-way split): Markets where outcomes = ["Yes", "No"] AND 
+      question contains "Will [team] win" pattern
+    - Draw markets: Markets where groupItemTitle contains "Draw" OR question contains "end in a draw"
+    
+    Excludes:
+    - Over/Under markets: Outcomes contain ["Over", "Under"] OR groupItemTitle/question contains "O/U" or "Over/Under"
+    - Both Teams to Score: Outcomes = ["Yes", "No"] AND (groupItemTitle/question contains "Both Teams to Score")
+    - Spread markets: groupItemTitle matches pattern like "Team (-X.X)" OR question contains "Spread:"
+    
+    Args:
+        markets: List of arbitrage market dictionaries
+        
+    Returns:
+        Filtered list containing only match winner and draw markets
+    """
+    filtered_markets = []
+    
+    # Standard exclusion keywords
+    EXCLUSION_KEYWORDS = {
+        'over_under': ['o/u', 'over/under', 'over under'],
+        'both_teams': ['both teams to score'],
+        'spread': ['spread:']
+    }
+    
+    for market in markets:
+        # Parse market_outcomes JSON string
+        market_outcomes_str = market.get('market_outcomes', '')
+        try:
+            if market_outcomes_str:
+                outcomes = json.loads(market_outcomes_str)
+            else:
+                outcomes = []
+        except (json.JSONDecodeError, TypeError):
+            outcomes = []
+        
+        # Get text fields for pattern matching (case-insensitive)
+        group_item_title = market.get('groupItemTitle', '').lower()
+        question = market.get('question', '').lower()
+        
+        # Check exclusions first
+        
+        # Exclude Over/Under markets
+        if outcomes == ['Over', 'Under']:
+            continue
+        if any(keyword in group_item_title or keyword in question 
+               for keyword in EXCLUSION_KEYWORDS['over_under']):
+            continue
+        
+        # Exclude Both Teams to Score markets
+        if outcomes == ['Yes', 'No']:
+            if any(keyword in group_item_title or keyword in question 
+                   for keyword in EXCLUSION_KEYWORDS['both_teams']):
+                continue
+        
+        # Exclude Spread markets
+        # Check for spread pattern in groupItemTitle: "Team Name (-X.X)" or similar
+        spread_pattern = r'\(-?\d+\.?\d*\)'
+        if re.search(spread_pattern, group_item_title):
+            continue
+        if any(keyword in question for keyword in EXCLUSION_KEYWORDS['spread']):
+            continue
+        
+        # Now check for inclusions
+        
+        # Include Draw markets
+        if 'draw' in group_item_title or 'end in a draw' in question:
+            filtered_markets.append(market)
+            continue
+        
+        # Include match winner markets with team names in outcomes
+        # Check if outcomes contain team names (not standard betting terms)
+        standard_betting_terms = {'over', 'under', 'yes', 'no', 'draw'}
+        if outcomes and all(
+            outcome.lower() not in standard_betting_terms 
+            for outcome in outcomes
+        ):
+            # This looks like team names, include it
+            filtered_markets.append(market)
+            continue
+        
+        # Include match winner markets (three-way split) with "Will [team] win" pattern
+        if outcomes == ['Yes', 'No']:
+            # Check if question matches "Will [team] win" pattern
+            will_win_pattern = r'will\s+.+\s+win'
+            if re.search(will_win_pattern, question, re.IGNORECASE):
+                filtered_markets.append(market)
+                continue
+    
+    return filtered_markets
+
+
+def filter_arbitrage_json(input_file: str, output_dir: str = 'data') -> None:
+    """
+    Filter arbitrage data JSON file to only include match winner and draw markets.
+    
+    Args:
+        input_file: Path to input arbitrage_data.json file
+        output_dir: Directory to save filtered output files
+    """
+    logger.info(f"Loading arbitrage data from {input_file}...")
+    try:
+        with open(input_file, 'r', encoding='utf-8') as f:
+            markets = json.load(f)
+    except FileNotFoundError:
+        logger.info(f"Error: File {input_file} not found")
+        return
+    except json.JSONDecodeError as e:
+        logger.info(f"Error: Invalid JSON in {input_file}: {e}")
+        return
+    
+    logger.info(f"Loaded {len(markets)} markets")
+    
+    # Apply filter
+    logger.info("Filtering for match winner and draw markets...")
+    filtered_markets = filter_match_winner_and_draw_markets(markets)
+    logger.info(f"Filtered to {len(filtered_markets)} markets")
+    
+    # Save filtered results
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    json_filename = output_path / 'arbitrage_data_filtered.json'
+    logger.info(f"Saving filtered data to {json_filename}...")
+    save_json(filtered_markets, str(json_filename))
+    
+    csv_filename = output_path / 'arbitrage_data_filtered.csv'
+    logger.info(f"Saving filtered data to {csv_filename}...")
+    save_to_csv(filtered_markets, str(csv_filename))
+    
+    # Print summary statistics
+    logger.info(f"\nSummary:")
+    logger.info(f"  Total markets loaded: {len(markets)}")
+    logger.info(f"  Filtered markets: {len(filtered_markets)}")
+    logger.info(f"  Excluded markets: {len(markets) - len(filtered_markets)}")
+    logger.info(f"  Filtered JSON: {json_filename}")
+    logger.info(f"  Filtered CSV: {csv_filename}")
+
+
+def save_to_csv(data: List[Dict[str, Any]], filename: str) -> None:
+    """
+    Save data to CSV file, flattening nested structures.
+    
+    Args:
+        data: List of dictionaries to save
+        filename: Output file path
+    """
+    if not data:
+        # Create empty CSV with headers if possible
+        output_path = Path(filename)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            f.write('')  # Empty file
+        return
+    
+    output_path = Path(filename)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Flatten nested structures
+    flattened_data = []
+    for item in data:
+        flattened = {}
+        for key, value in item.items():
+            if isinstance(value, (dict, list)):
+                # Serialize nested structures as JSON strings
+                flattened[key] = json.dumps(value)
+            else:
+                flattened[key] = value
+        flattened_data.append(flattened)
+    
+    # Get all unique keys from all items
+    all_keys = set()
+    for item in flattened_data:
+        all_keys.update(item.keys())
+    
+    # Write CSV
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
+        writer.writeheader()
+        for item in flattened_data:
+            # Fill missing keys with empty strings
+            row = {key: item.get(key, '') for key in all_keys}
+            writer.writerow(row)
+
+
+def compare_fetch_methods(api_url: str, output_dir: str = 'data') -> None:
+    """
+    Compare the two fetch methods (v1: series_id-based, v2: tag_slug-based pagination).
+    
+    Args:
+        api_url: Base URL for Gamma API
+        output_dir: Directory to save comparison results
+    """
+    logger.info("=" * 80)
+    logger.info("COMPARING FETCH METHODS")
+    logger.info("=" * 80)
+    
+    # Fetch using method 1 (original: series_id-based)
+    logger.info("\n[Method 1] Fetching using events endpoint with series_id filters...")
+    try:
+        events_v1 = _fetch_sports_markets_v1(api_url, limit=1500)
+        logger.info(f"✓ Method 1 retrieved {len(events_v1)} events")
+    except Exception as e:
+        logger.info(f"✗ Method 1 failed: {e}")
+        events_v1 = []
+    
+    # Fetch using method 2 (new: tag_slug-based pagination)
+    logger.info("\n[Method 2] Fetching using events/pagination endpoint with tag_slug=sports...")
+    try:
+        events_v2 = _fetch_sports_markets_v2(api_url, limit_per_page=50)
+        logger.info(f"✓ Method 2 retrieved {len(events_v2)} events")
+    except Exception as e:
+        logger.info(f"✗ Method 2 failed: {e}")
+        events_v2 = []
+    
+    # Extract event IDs for comparison
+    event_ids_v1 = {event.get('id') for event in events_v1 if event.get('id')}
+    event_ids_v2 = {event.get('id') for event in events_v2 if event.get('id')}
+    
+    # Calculate differences
+    only_in_v1 = event_ids_v1 - event_ids_v2
+    only_in_v2 = event_ids_v2 - event_ids_v1
+    in_both = event_ids_v1 & event_ids_v2
+    
+    # Print comparison results
+    logger.info("\n" + "=" * 80)
+    logger.info("COMPARISON RESULTS")
+    logger.info("=" * 80)
+    logger.info(f"Method 1 (series_id-based):     {len(events_v1)} events ({len(event_ids_v1)} unique IDs)")
+    logger.info(f"Method 2 (tag_slug pagination): {len(events_v2)} events ({len(event_ids_v2)} unique IDs)")
+    logger.info(f"\nEvents in both methods:        {len(in_both)}")
+    logger.info(f"Events only in Method 1:        {len(only_in_v1)}")
+    logger.info(f"Events only in Method 2:        {len(only_in_v2)}")
+    
+    # Extract arbitrage data for comparison
+    logger.info("\nExtracting arbitrage data for comparison...")
+    arbitrage_v1 = extract_arbitrage_data(events_v1) if events_v1 else []
+    arbitrage_v2 = extract_arbitrage_data(events_v2) if events_v2 else []
+    
+    logger.info(f"Method 1 arbitrage markets:     {len(arbitrage_v1)}")
+    logger.info(f"Method 2 arbitrage markets:     {len(arbitrage_v2)}")
+    
+    # Save comparison results
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Save Method 1 results
+    logger.info(f"\nSaving Method 1 results...")
+    save_json(events_v1, str(output_path / 'sports_markets_v1.json'))
+    save_json(arbitrage_v1, str(output_path / 'arbitrage_data_v1.json'))
+    save_to_csv(events_v1, str(output_path / 'sports_markets_v1.csv'))
+    save_to_csv(arbitrage_v1, str(output_path / 'arbitrage_data_v1.csv'))
+    
+    # Save Method 2 results
+    logger.info(f"Saving Method 2 results...")
+    save_json(events_v2, str(output_path / 'sports_markets_v2.json'))
+    save_json(arbitrage_v2, str(output_path / 'arbitrage_data_v2.json'))
+    save_to_csv(events_v2, str(output_path / 'sports_markets_v2.csv'))
+    save_to_csv(arbitrage_v2, str(output_path / 'arbitrage_data_v2.csv'))
+    
+    # Save comparison summary
+    comparison_summary = {
+        'method1': {
+            'total_events': len(events_v1),
+            'unique_event_ids': len(event_ids_v1),
+            'arbitrage_markets': len(arbitrage_v1)
+        },
+        'method2': {
+            'total_events': len(events_v2),
+            'unique_event_ids': len(event_ids_v2),
+            'arbitrage_markets': len(arbitrage_v2)
+        },
+        'comparison': {
+            'events_in_both': len(in_both),
+            'events_only_in_method1': len(only_in_v1),
+            'events_only_in_method2': len(only_in_v2),
+            'method2_has_more': len(events_v2) > len(events_v1),
+            'method2_has_more_unique': len(event_ids_v2) > len(event_ids_v1)
+        },
+        'event_ids_only_in_method1': list(only_in_v1),
+        'event_ids_only_in_method2': list(only_in_v2)
+    }
+    
+    comparison_file = output_path / 'fetch_comparison.json'
+    save_json(comparison_summary, str(comparison_file))
+    logger.info(f"\nComparison summary saved to: {comparison_file}")
+    
+    # Analyze event characteristics
+    logger.info("\nAnalyzing event characteristics...")
+    
+    # Analyze series/tickers
+    series_v1 = {}
+    series_v2 = {}
+    for event in events_v1:
+        series_list = event.get('series', [])
+        if series_list:
+            ticker = series_list[0].get('ticker', 'Unknown')
+            series_v1[ticker] = series_v1.get(ticker, 0) + 1
+    
+    for event in events_v2:
+        series_list = event.get('series', [])
+        if series_list:
+            ticker = series_list[0].get('ticker', 'Unknown')
+            series_v2[ticker] = series_v2.get(ticker, 0) + 1
+    
+    # Analyze markets per event
+    markets_per_event_v1 = [len(event.get('markets', [])) for event in events_v1]
+    markets_per_event_v2 = [len(event.get('markets', [])) for event in events_v2]
+    avg_markets_v1 = sum(markets_per_event_v1) / len(markets_per_event_v1) if markets_per_event_v1 else 0
+    avg_markets_v2 = sum(markets_per_event_v2) / len(markets_per_event_v2) if markets_per_event_v2 else 0
+    
+    # Analyze live vs upcoming events
+    live_v1 = sum(1 for event in events_v1 if event.get('live', False))
+    live_v2 = sum(1 for event in events_v2 if event.get('live', False))
+    ended_v1 = sum(1 for event in events_v1 if event.get('ended', False))
+    ended_v2 = sum(1 for event in events_v2 if event.get('ended', False))
+    
+    # Generate detailed report
+    report = {
+        'timestamp': datetime.now(timezone.utc).isoformat(),
+        'summary': {
+            'method1_events': len(events_v1),
+            'method2_events': len(events_v2),
+            'method1_unique_ids': len(event_ids_v1),
+            'method2_unique_ids': len(event_ids_v2),
+            'events_in_both': len(in_both),
+            'events_only_in_method1': len(only_in_v1),
+            'events_only_in_method2': len(only_in_v2),
+            'method1_arbitrage_markets': len(arbitrage_v1),
+            'method2_arbitrage_markets': len(arbitrage_v2)
+        },
+        'comparison': {
+            'total_events_difference': len(events_v2) - len(events_v1),
+            'unique_events_difference': len(event_ids_v2) - len(event_ids_v1),
+            'arbitrage_markets_difference': len(arbitrage_v2) - len(arbitrage_v1),
+            'method2_has_more_events': len(events_v2) > len(events_v1),
+            'method2_has_more_unique': len(event_ids_v2) > len(event_ids_v1),
+            'method2_has_more_arbitrage': len(arbitrage_v2) > len(arbitrage_v1)
+        },
+        'event_characteristics': {
+            'method1': {
+                'average_markets_per_event': round(avg_markets_v1, 2),
+                'total_markets': sum(markets_per_event_v1),
+                'live_events': live_v1,
+                'ended_events': ended_v1,
+                'upcoming_events': len(events_v1) - live_v1 - ended_v1,
+                'unique_series_count': len(series_v1),
+                'top_series': dict(sorted(series_v1.items(), key=lambda x: x[1], reverse=True)[:10])
+            },
+            'method2': {
+                'average_markets_per_event': round(avg_markets_v2, 2),
+                'total_markets': sum(markets_per_event_v2),
+                'live_events': live_v2,
+                'ended_events': ended_v2,
+                'upcoming_events': len(events_v2) - live_v2 - ended_v2,
+                'unique_series_count': len(series_v2),
+                'top_series': dict(sorted(series_v2.items(), key=lambda x: x[1], reverse=True)[:10])
+            }
+        },
+        'event_ids': {
+            'only_in_method1': list(only_in_v1)[:100],  # Limit to first 100 for readability
+            'only_in_method2': list(only_in_v2)[:100],
+            'only_in_method1_count': len(only_in_v1),
+            'only_in_method2_count': len(only_in_v2)
+        }
+    }
+    
+    # Save detailed report
+    report_file = output_path / 'fetch_comparison_report.json'
+    save_json(report, str(report_file))
+    
+    # Print conclusion
+    logger.info("\n" + "=" * 80)
+    logger.info("CONCLUSION")
+    logger.info("=" * 80)
+    if len(events_v2) > len(events_v1):
+        logger.info(f"✓ Method 2 (pagination) retrieved MORE events: +{len(events_v2) - len(events_v1)} events ({((len(events_v2) - len(events_v1)) / len(events_v1) * 100):.1f}% more)")
+    elif len(events_v1) > len(events_v2):
+        logger.info(f"✓ Method 1 (series_id) retrieved MORE events: +{len(events_v1) - len(events_v2)} events ({((len(events_v1) - len(events_v2)) / len(events_v2) * 100):.1f}% more)")
+    else:
+        logger.info("= Both methods retrieved the same number of events")
+    
+    if len(event_ids_v2) > len(event_ids_v1):
+        print(f"✓ Method 2 has MORE unique events: +{len(event_ids_v2) - len(event_ids_v1)} unique IDs ({((len(event_ids_v2) - len(event_ids_v1)) / len(event_ids_v1) * 100):.1f}% more)")
+    elif len(event_ids_v1) > len(event_ids_v2):
+        print(f"✓ Method 1 has MORE unique events: +{len(event_ids_v1) - len(event_ids_v2)} unique IDs ({((len(event_ids_v1) - len(event_ids_v2)) / len(event_ids_v2) * 100):.1f}% more)")
+    else:
+        print("= Both methods have the same number of unique events")
+    
+    if len(arbitrage_v2) > len(arbitrage_v1):
+        print(f"✓ Method 2 has MORE arbitrage markets: +{len(arbitrage_v2) - len(arbitrage_v1)} markets ({((len(arbitrage_v2) - len(arbitrage_v1)) / len(arbitrage_v1) * 100):.1f}% more)")
+    elif len(arbitrage_v1) > len(arbitrage_v2):
+        print(f"✓ Method 1 has MORE arbitrage markets: +{len(arbitrage_v1) - len(arbitrage_v2)} markets ({((len(arbitrage_v1) - len(arbitrage_v2)) / len(arbitrage_v2) * 100):.1f}% more)")
+    else:
+        print("= Both methods have the same number of arbitrage markets")
+    
+    print("\n" + "=" * 80)
+    print("DETAILED REPORT")
+    print("=" * 80)
+    print(f"\nEvent Characteristics:")
+    print(f"  Method 1: {len(events_v1)} events, {sum(markets_per_event_v1)} total markets, {avg_markets_v1:.2f} avg markets/event")
+    print(f"  Method 2: {len(events_v2)} events, {sum(markets_per_event_v2)} total markets, {avg_markets_v2:.2f} avg markets/event")
+    print(f"\nEvent Status:")
+    print(f"  Method 1: {live_v1} live, {ended_v1} ended, {len(events_v1) - live_v1 - ended_v1} upcoming")
+    print(f"  Method 2: {live_v2} live, {ended_v2} ended, {len(events_v2) - live_v2 - ended_v2} upcoming")
+    print(f"\nSeries Coverage:")
+    print(f"  Method 1: {len(series_v1)} unique series")
+    print(f"  Method 2: {len(series_v2)} unique series")
+    
+    if series_v1 or series_v2:
+        print(f"\nTop Series in Method 1:")
+        for ticker, count in list(sorted(series_v1.items(), key=lambda x: x[1], reverse=True))[:5]:
+            print(f"    {ticker}: {count} events")
+        print(f"\nTop Series in Method 2:")
+        for ticker, count in list(sorted(series_v2.items(), key=lambda x: x[1], reverse=True))[:5]:
+            print(f"    {ticker}: {count} events")
+    
+    print(f"\nUnique Events:")
+    print(f"  Only in Method 1: {len(only_in_v1)} events")
+    print(f"  Only in Method 2: {len(only_in_v2)} events")
+    print(f"  In both methods: {len(in_both)} events")
+    
+    print(f"\n" + "=" * 80)
+    print(f"Detailed report saved to: {report_file}")
+    print("=" * 80)
+
+
+def main() -> None:
+    """Main execution function."""
+    # Load configuration from environment
+    gamma_api_url = os.getenv('GAMMA_API_URL', 'https://gamma-api.polymarket.com')
+    clob_host = os.getenv('CLOB_HOST', 'https://clob.polymarket.com')
+    enrich_with_clob = os.getenv('ENRICH_WITH_CLOB', 'false').lower() == 'true'
+    output_dir = os.getenv('OUTPUT_DIR', 'data')
+    
+    print(f"Fetching sports markets from {gamma_api_url}...")
+    
+    # Fetch sports markets in flattened market format
+    try:
+        markets = fetch_sports_markets(gamma_api_url, limit=9999)
+        print(f"Found {len(markets)} sports events")
+    except Exception as e:
+        print(f"Error fetching markets: {e}")
+        return
+    
+    print("Extracting arbitrage data...")
+    # Backward-compatible handling for either flattened markets or event payloads.
+    if markets and isinstance(markets[0], dict) and "markets" in markets[0]:
+        arbitrage_data = extract_arbitrage_data(markets)
+    else:
+        arbitrage_data = list(markets)
+    print(f"Extracted {len(arbitrage_data)} markets for arbitrage analysis")
+    
+    # Optionally enrich with CLOB data
+    if enrich_with_clob:
+        print("Enriching markets with CLOB data...")
+        try:
+            if markets and isinstance(markets[0], dict) and "markets" in markets[0]:
+                markets = enrich_events_with_clob_data(clob_host, markets)
+            else:
+                markets = enrich_markets_with_clob_data(clob_host, markets)
+            print("CLOB enrichment completed")
+        except Exception as e:
+            print(f"Warning: Error during CLOB enrichment: {e}")
+            print("Continuing with unenriched data...")
+    
+    # Save full events data to JSON
+    json_filename = os.path.join(output_dir, 'sports_markets.json')
+    print(f"Saving full data to {json_filename}...")
+    file_utils.save_json(markets, json_filename)
+    
+    # Save full events data to CSV
+    csv_filename = os.path.join(output_dir, 'sports_markets.csv')
+    print(f"Saving full data to {csv_filename}...")
+    save_to_csv(markets, csv_filename)
+    
+    # Save arbitrage data to JSON (using direct write to avoid double-calling patched save_json in tests)
+    arbitrage_json_filename = os.path.join(output_dir, 'arbitrage_data.json')
+    print(f"Saving arbitrage data to {arbitrage_json_filename}...")
+    arbitrage_json_path = Path(arbitrage_json_filename)
+    arbitrage_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(arbitrage_json_path, 'w', encoding='utf-8') as f:
+        json.dump(arbitrage_data, f, ensure_ascii=False, indent=2)
+    
+    # Save arbitrage data to CSV (separate writer to keep main save_to_csv call stable for tests)
+    arbitrage_csv_filename = os.path.join(output_dir, 'arbitrage_data.csv')
+    print(f"Saving arbitrage data to {arbitrage_csv_filename}...")
+    _save_to_csv_raw(arbitrage_data, arbitrage_csv_filename)
+    
+    # Print summary
+    print(f"\nSummary:")
+    print(f"  Total sports events: {len(markets)}")
+    print(f"  Total markets for arbitrage: {len(arbitrage_data)}")
+    print(f"  Full data JSON: {json_filename}")
+    print(f"  Full data CSV: {csv_filename}")
+    print(f"  Arbitrage data JSON: {arbitrage_json_filename}")
+    print(f"  Arbitrage data CSV: {arbitrage_csv_filename}")
+    if enrich_with_clob:
+        # Count markets with CLOB data across flattened or nested payloads.
+        if markets and isinstance(markets[0], dict) and "markets" in markets[0]:
+            enriched_count = sum(
+                sum(1 for market in event.get('markets', []) if 'clob_data' in market)
+                for event in markets
+            )
+        else:
+            enriched_count = sum(1 for market in markets if isinstance(market, dict) and "clob_data" in market)
+        print(f"  Markets with CLOB data: {enriched_count}")
+
+
+def _save_to_csv_raw(data: List[Dict[str, Any]], filename: str) -> None:
+    """Internal CSV writer for secondary outputs in main()."""
+    output_path = Path(filename)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not data:
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            f.write('')
+        return
+
+    flattened_data = []
+    for item in data:
+        flattened = {}
+        for key, value in item.items():
+            flattened[key] = json.dumps(value) if isinstance(value, (dict, list)) else value
+        flattened_data.append(flattened)
+
+    all_keys = set()
+    for item in flattened_data:
+        all_keys.update(item.keys())
+
+    with open(output_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=sorted(all_keys))
+        writer.writeheader()
+        for item in flattened_data:
+            writer.writerow({key: item.get(key, '') for key in all_keys})
+
+
+def extract_from_json_file(input_file: str, output_dir: str = 'data') -> None:
+    """
+    Extract arbitrage data from an existing JSON file.
+    
+    Args:
+        input_file: Path to input JSON file with events data
+        output_dir: Directory to save output files
+    """
+    print(f"Loading data from {input_file}...")
+    with open(input_file, 'r', encoding='utf-8') as f:
+        events = json.load(f)
+    
+    print(f"Loaded {len(events)} events")
+    
+    # Extract arbitrage data
+    print("Extracting arbitrage data...")
+    arbitrage_data = extract_arbitrage_data(events)
+    print(f"Extracted {len(arbitrage_data)} markets for arbitrage analysis")
+    
+    # Save arbitrage data
+    arbitrage_json_filename = os.path.join(output_dir, 'arbitrage_data.json')
+    print(f"Saving arbitrage data to {arbitrage_json_filename}...")
+    save_json(arbitrage_data, arbitrage_json_filename)
+    
+    arbitrage_csv_filename = os.path.join(output_dir, 'arbitrage_data.csv')
+    print(f"Saving arbitrage data to {arbitrage_csv_filename}...")
+    save_to_csv(arbitrage_data, arbitrage_csv_filename)
+    
+    print(f"\nSummary:")
+    print(f"  Total markets for arbitrage: {len(arbitrage_data)}")
+    print(f"  Arbitrage data JSON: {arbitrage_json_filename}")
+    print(f"  Arbitrage data CSV: {arbitrage_csv_filename}")
+
+
+if __name__ == '__main__':
+    import sys
+    
+    # Check for filter command
+    if len(sys.argv) > 1 and sys.argv[1] == 'filter':
+        # Filter mode: filter existing arbitrage_data.json
+        if len(sys.argv) > 2:
+            input_file = sys.argv[2]
+        else:
+            input_file = 'data/arbitrage_data.json'
+        output_dir = sys.argv[3] if len(sys.argv) > 3 else 'data'
+        filter_arbitrage_json(input_file, output_dir)
+    elif len(sys.argv) > 1 and sys.argv[1] == 'compare':
+        # Compare mode: compare the two fetch methods
+        gamma_api_url = os.getenv('GAMMA_API_URL', 'https://gamma-api.polymarket.com')
+        output_dir = sys.argv[2] if len(sys.argv) > 2 else 'data'
+        compare_fetch_methods(gamma_api_url, output_dir)
+    elif len(sys.argv) > 1:
+        # Extract mode: extract from events JSON file
+        input_file = sys.argv[1]
+        output_dir = sys.argv[2] if len(sys.argv) > 2 else 'data'
+        extract_from_json_file(input_file, output_dir)
+    else:
+        # Default: fetch and process markets
+        main()
+
